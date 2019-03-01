@@ -15,6 +15,8 @@ trait Realisation {
 sealed trait SchemaF[Prim[_], SumTermId, ProductTermId, F[_], A] { //self =>
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A]
   //    def imap[B](iso: Iso[A, B]): Schema.FSchema[B] = Schema.IsoSchema(self, iso)
+
+  def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A]
 }
 
 ////////////////////
@@ -26,6 +28,9 @@ sealed trait SchemaF[Prim[_], SumTermId, ProductTermId, F[_], A] { //self =>
 final case class One[Prim[_], SumTermId, ProductTermId, F[_]]()
     extends SchemaF[Prim, SumTermId, ProductTermId, F, Unit] {
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, Unit] = One()
+
+  @inline def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[Unit] =
+    f.one
 }
 
 /**
@@ -37,6 +42,11 @@ final case class :+:[Prim[_], SumTermId, ProductTermId, F[_], A, B](left: F[A], 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A \/ B] =
     :+:(nt(left), nt(right))
   override def toString: String = s"$left :+: $right"
+
+  @inline def fold[S[_]](
+    f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]
+  ): S[A \/ B] =
+    f.disjunction[A, B](left, right)
 }
 
 /**
@@ -48,6 +58,11 @@ final case class :*:[F[_], A, B, Prim[_], SumTermId, ProductTermId](left: F[A], 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, (A, B)] =
     :*:(nt(left), nt(right))
   override def toString: String = s"$left :*: $right"
+
+  @inline def fold[S[_]](
+    f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]
+  ): S[(A, B)] =
+    f.conjunction[A, B](left, right)
 }
 
 // "Extra" nodes, making it more convenient to represent real-world types
@@ -60,6 +75,9 @@ final case class PrimSchema[F[_], A, Prim[_], SumTermId, ProductTermId](prim: Pr
 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
     PrimSchema[G, A, Prim, SumTermId, ProductTermId](prim)
+
+  @inline def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.prim[A](prim)
 }
 
 /**
@@ -70,19 +88,31 @@ final case class SumTerm[F[_], A, Prim[_], SumTermId, ProductTermId](id: SumTerm
 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
     SumTerm(id, nt(schema))
+
+  @inline def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.sumTerm[A](id, schema)
 }
 
 /**
  * An union, eg. a sum of named branches
  * This class cannot be constructed directly, you must use the `SchemaModule#union` method.
  */
-sealed abstract case class Union[Prim[_], SumTermId, ProductTermId, F[_], A, AE](
-  choices: F[AE],
+final case class Union[Prim[_], SumTermId, ProductTermId, F[_], A, AE](
+  choices: SchemaF.LabelledTree[\/, SumTermId, F, AE],
   iso: Iso[AE, A]
 ) extends SchemaF[Prim, SumTermId, ProductTermId, F, A] {
 
-  def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
-    new Union[Prim, SumTermId, ProductTermId, G, A, AE](nt(choices), iso) {}
+  def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] = {
+    val nt2 =
+      LabelTree
+        .labelTreeFunctor[\/]
+        .andThen[λ[(F[_], X) => (SumTermId, F[X])]](SchemaF.labelledNT[SumTermId])
+        .hmap(nt)
+    Union[Prim, SumTermId, ProductTermId, G, A, AE](nt2(choices), iso)
+  }
+
+  def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.union(choices, iso)
 }
 
 /**
@@ -95,19 +125,31 @@ final case class ProductTerm[F[_], A, Prim[_], SumTermId, ProductTermId](
 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
     ProductTerm(id, nt(schema))
+
+  @inline def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.productTerm[A](id, schema)
 }
 
 /**
  * A record, eg. a product of named fields
  * This class cannot be constructed directly, you must use the `SchemaModule#record` method.
  */
-sealed abstract case class Record[Prim[_], SumTermId, ProductTermId, F[_], A, AP](
-  fields: F[AP],
+final case class Record[Prim[_], SumTermId, ProductTermId, F[_], A, AP](
+  fields: SchemaF.LabelledTree[Tuple2, ProductTermId, F, AP],
   iso: Iso[AP, A]
 ) extends SchemaF[Prim, SumTermId, ProductTermId, F, A] {
 
-  def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
-    new Record[Prim, SumTermId, ProductTermId, G, A, AP](nt(fields), iso) {}
+  def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] = {
+    val nt2 =
+      LabelTree
+        .labelTreeFunctor[Tuple2]
+        .andThen[λ[(F[_], X) => (ProductTermId, F[X])]](SchemaF.labelledNT[ProductTermId])
+        .hmap(nt)
+    Record[Prim, SumTermId, ProductTermId, G, A, AP](nt2(fields), iso)
+  }
+
+  def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.record(fields, iso)
 }
 
 /**
@@ -118,6 +160,11 @@ final case class SeqSchema[F[_], A, Prim[_], SumTermId, ProductTermId](element: 
 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, List[A]] =
     SeqSchema(nt(element))
+
+  @inline def fold[S[_]](
+    f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]
+  ): S[List[A]] =
+    f.seqSchema[A](element)
 }
 
 /**
@@ -131,6 +178,9 @@ final case class IsoSchema[Prim[_], SumTermId, ProductTermId, F[_], A0, A](
 
   def hmap[G[_]](nt: F ~> G): SchemaF[Prim, SumTermId, ProductTermId, G, A] =
     IsoSchema(nt(base), iso)
+
+  @inline def fold[S[_]](f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]): S[A] =
+    f.isoSchema[A0, A](base, iso)
 }
 
 /**
@@ -172,7 +222,96 @@ class HyloInterpreter[S[_[_], _], F[_], G[_]](
   final override val interpret = hyloNT(coalgebra, algebra)
 }
 
+sealed abstract class LabelTree[D[_, _], F[_], A] {
+  def fold[G[_]](leaf: F ~> G, node: LabelTree.ElimNode[D, G]): G[A]
+}
+
+object LabelTree {
+  final case class Leaf[D[_, _], F[_], A](value: F[A]) extends LabelTree[D, F, A] {
+    def fold[G[_]](leaf: F ~> G, node: LabelTree.ElimNode[D, G]): G[A] = leaf(value)
+
+    @inline final def map2[G[_]](nt: F ~> G): LabelTree[D, G, A] =
+      labelTreeFunctor[D].hmap(nt)(this)
+  }
+  final case class Node[D[_, _], F[_], A, B](
+    left: LabelTree[D, F, A],
+    right: LabelTree[D, F, B]
+  ) extends LabelTree[D, F, D[A, B]] {
+
+    def fold[G[_]](leaf: F ~> G, node: LabelTree.ElimNode[D, G]): G[D[A, B]] = {
+      val l: G[A] = left.fold[G](leaf, node)
+      val r: G[B] = right.fold[G](leaf, node)
+      node[A, B](l, r)
+    }
+  }
+
+  trait ElimNode[D[_, _], G[_]] {
+    def apply[A, B](left: G[A], right: G[B]): G[D[A, B]]
+  }
+
+  @inline def leaf[D[_, _], F[_]]: F ~> LabelTree[D, F, ?] =
+    new (F ~> LabelTree[D, F, ?]) {
+      def apply[A](fa: F[A]): LabelTree[D, F, A] = Leaf(fa)
+    }
+
+  implicit def labelTreeFunctor[D[_, _]] = new HFunctor[LabelTree[D, ?[_], ?]] {
+
+    def hmap[F[_], G[_]](nt: F ~> G) = new (LabelTree[D, F, ?] ~> LabelTree[D, G, ?]) {
+
+      def apply[A](fa: LabelTree[D, F, A]): LabelTree[D, G, A] =
+        fa match {
+          case Leaf(fa) => Leaf(nt(fa))
+          case n: Node[d, f, a, b] =>
+            Node[d, G, a, b](apply[a](n.left), apply[b](n.right))
+        }
+    }
+  }
+}
+
+trait Alter[F[_]] {
+  def apply[A, B](fa: F[A], fb: F[B]): F[A \/ B]
+}
+
 object SchemaF {
+
+  @inline def fold[Prim[_], SumTermId, ProductTermId, F[_], S[_]](
+    f: SchemaF.Algebra[Prim, SumTermId, ProductTermId, F, S]
+  ): SchemaF[Prim, SumTermId, ProductTermId, F, ?] ~> S =
+    new (SchemaF[Prim, SumTermId, ProductTermId, F, ?] ~> S) {
+
+      def apply[A](fa: SchemaF[Prim, SumTermId, ProductTermId, F, A]): S[A] =
+        fa.fold[S](f)
+    }
+
+  type LabelledTree[D[_, _], TermId, F[_], A] = LabelTree[D, λ[X => (TermId, F[X])], A]
+
+  implicit def labelledNT[TermId] = new HFunctor[λ[(F[_], X) => (TermId, F[X])]] {
+
+    def hmap[F[_], G[_]](nt: F ~> G) = new (λ[X => (TermId, F[X])] ~> λ[X => (TermId, G[X])]) {
+
+      def apply[A](fa: (TermId, F[A])): (TermId, G[A]) =
+        (fa._1, nt(fa._2))
+    }
+  }
+
+  def labelledLeaf[D[_, _], TermId, F[_], A](
+    id: TermId,
+    schema: F[A]
+  ): LabelledTree[D, TermId, F, A] =
+    LabelTree.Leaf[D, λ[X => (TermId, F[X])], A]((id, schema))
+
+  trait Algebra[Prim[_], SumTermId, ProductTermId, F[_], S[_]] {
+    def one: S[Unit]
+    def prim[A](prim: Prim[A]): S[A]
+    def disjunction[A, B](left: F[A], right: F[B]): S[A \/ B]
+    def conjunction[A, B](left: F[A], right: F[B]): S[(A, B)]
+    def sumTerm[A](id: SumTermId, fa: F[A]): S[A]
+    def productTerm[A](id: ProductTermId, fa: F[A]): S[A]
+    def seqSchema[A](elements: F[A]): S[List[A]]
+    def isoSchema[AO, A](choices: F[AO], iso: Iso[AO, A]): S[A]
+    def union[AE, A](choices: LabelledTree[\/, SumTermId, F, AE], iso: Iso[AE, A]): S[A]
+    def record[AE, A](choices: LabelledTree[Tuple2, ProductTermId, F, AE], iso: Iso[AE, A]): S[A]
+  }
 
   implicit def schemaHFunctor[Prim[_], SumTermId, ProductTermId] =
     new HFunctor[SchemaF[Prim, SumTermId, ProductTermId, ?[_], ?]] {
@@ -191,54 +330,6 @@ object SchemaF {
 
   type FSchema[Prim[_], SumTermId, ProductTermId, A] =
     Fix[SchemaF[Prim, SumTermId, ProductTermId, ?[_], ?], A]
-
-  sealed private[schema] trait LabelledSum_[Prim[_], SumTermId, ProductTermId, A] {
-    def toSchema: FSchema[Prim, SumTermId, ProductTermId, A]
-
-    def :+: [B](
-      l: LabelledSum_[Prim, SumTermId, ProductTermId, B]
-    ): LabelledSum_[Prim, SumTermId, ProductTermId, B \/ A] = LabelledSum2(l, this)
-  }
-
-  final private[schema] case class LabelledSum1[Prim[_], SumTermId, ProductTermId, A](
-    id: SumTermId,
-    schema: FSchema[Prim, SumTermId, ProductTermId, A]
-  ) extends LabelledSum_[Prim, SumTermId, ProductTermId, A] {
-    def toSchema = Fix(SumTerm(id, schema))
-
-  }
-
-  final private[schema] case class LabelledSum2[Prim[_], SumTermId, ProductTermId, A, B](
-    l: LabelledSum_[Prim, SumTermId, ProductTermId, A],
-    r: LabelledSum_[Prim, SumTermId, ProductTermId, B]
-  ) extends LabelledSum_[Prim, SumTermId, ProductTermId, A \/ B] {
-    def toSchema = Fix(new :+:(l.toSchema, r.toSchema))
-
-  }
-
-  sealed private[schema] trait LabelledProduct_[Prim[_], SumTermId, ProductTermId, A] {
-    def toSchema: FSchema[Prim, SumTermId, ProductTermId, A]
-
-    def :*: [B](
-      l: LabelledProduct_[Prim, SumTermId, ProductTermId, B]
-    ): LabelledProduct_[Prim, SumTermId, ProductTermId, (B, A)] = LabelledProduct2(l, this)
-  }
-
-  final private[schema] case class LabelledProduct1[Prim[_], SumTermId, ProductTermId, A](
-    id: ProductTermId,
-    schema: FSchema[Prim, SumTermId, ProductTermId, A]
-  ) extends LabelledProduct_[Prim, SumTermId, ProductTermId, A] {
-    def toSchema = Fix(ProductTerm(id, schema))
-
-  }
-
-  final private[schema] case class LabelledProduct2[Prim[_], SumTermId, ProductTermId, A, B](
-    l: LabelledProduct_[Prim, SumTermId, ProductTermId, A],
-    r: LabelledProduct_[Prim, SumTermId, ProductTermId, B]
-  ) extends LabelledProduct_[Prim, SumTermId, ProductTermId, (A, B)] {
-    def toSchema = Fix(new :*:(l.toSchema, r.toSchema))
-
-  }
 }
 
 trait SchemaModule[R <: Realisation] {
@@ -253,9 +344,8 @@ trait SchemaModule[R <: Realisation] {
 
   type Schema[A] = FSchema[R.Prim, R.SumTermId, R.ProductTermId, A]
 
-  type LabelledSum[A] = LabelledSum_[R.Prim, R.SumTermId, R.ProductTermId, A]
-
-  type LabelledProduct[A] = LabelledProduct_[R.Prim, R.SumTermId, R.ProductTermId, A]
+  type LabelledSum[A]     = LabelTree[\/, λ[X => (R.SumTermId, Schema[X])], A]
+  type LabelledProduct[A] = LabelTree[Tuple2, λ[X => (R.ProductTermId, Schema[X])], A]
 
   type ROne[F[_]]            = One[R.Prim, R.SumTermId, R.ProductTermId, F]
   type RSum[F[_], A, B]      = :+:[R.Prim, R.SumTermId, R.ProductTermId, F, A, B]
@@ -288,9 +378,11 @@ trait SchemaModule[R <: Realisation] {
 
     def :+: [B](left: Schema[B]): Schema[B \/ A] = Fix(new :+:(left, schema))
 
-    def -*>: (id: R.ProductTermId): LabelledProduct[A] = LabelledProduct1(id, schema)
+    def -*>: (id: R.ProductTermId): LabelledProduct[A] =
+      labelledLeaf[Tuple2, R.ProductTermId, Schema, A](id, schema)
 
-    def -+>: (id: R.SumTermId): LabelledSum[A] = LabelledSum1(id, schema)
+    def -+>: (id: R.SumTermId): LabelledSum[A] =
+      labelledLeaf[\/, R.SumTermId, Schema, A](id, schema)
 
     def to[F[_]](implicit interpreter: RInterpreter[F]): F[A] = interpreter.interpret(schema)
 
@@ -311,14 +403,14 @@ trait SchemaModule[R <: Realisation] {
 
   final def union[A, AE](choices: LabelledSum[AE], iso: Iso[AE, A]): Schema[A] =
     Fix(
-      new Union[
+      Union[
         R.Prim,
         R.SumTermId,
         R.ProductTermId,
         FSchema[R.Prim, R.SumTermId, R.ProductTermId, ?],
         A,
         AE
-      ](choices.toSchema, iso) {}
+      ](choices, iso)
     )
 
   final def optional[A](aSchema: Schema[A]): Schema[Option[A]] =
@@ -338,14 +430,14 @@ trait SchemaModule[R <: Realisation] {
 
   final def record[A, An](terms: LabelledProduct[An], isoA: Iso[An, A]): Schema[A] =
     Fix(
-      new Record[
+      Record[
         R.Prim,
         R.SumTermId,
         R.ProductTermId,
         FSchema[R.Prim, R.SumTermId, R.ProductTermId, ?],
         A,
         An
-      ](terms.toSchema, isoA) {}
+      ](terms, isoA)
     )
 
   final def seq[A](element: Schema[A]): Schema[List[A]] =
@@ -353,5 +445,4 @@ trait SchemaModule[R <: Realisation] {
 
   final def iso[A0, A](base: Schema[A0], iso: Iso[A0, A]): Schema[A] =
     Fix(IsoSchema(base, iso))
-
 }
